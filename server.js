@@ -542,7 +542,7 @@ app.post('/api/deposit', async (req, res) => {
         amount: amount,
         reference: refId,
         description: description || 'MsupaChat Unlock',
-        callback_url: process.env.MPESA_CALLBACK_URL || 'https://api.msupachat.com/api/mpesa/callback',
+        callback_url: process.env.MPESA_CALLBACK_URL || 'https://api.msupachat.com/api/megapay/webhook',
         email: process.env.MEGAPAY_EMAIL
       };
 
