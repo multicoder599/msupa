@@ -13,20 +13,18 @@ const path = require('path');
 const fs = require('fs');
 
 /* =========================
-   RESEND (OPTIONAL — won't crash if react/react-dom missing)
+   SAFE EMAIL LOADER (lazy)
    ========================= */
-let resend = null;
-try {
-  const { Resend } = require('resend');
-  if (process.env.RESEND_API_KEY && !process.env.RESEND_API_KEY.includes('xxxx')) {
-    resend = new Resend(process.env.RESEND_API_KEY);
-    console.log('[EMAIL] Resend loaded successfully');
-  } else {
-    console.warn('[EMAIL] RESEND_API_KEY not set. Emails disabled.');
+function getResend() {
+  const key = process.env.RESEND_API_KEY;
+  if (!key || key.includes('xxxx') || key.length < 10) return null;
+  try {
+    const { Resend } = require('resend');
+    return new Resend(key);
+  } catch (e) {
+    console.warn('[EMAIL] Resend unavailable:', e.message);
+    return null;
   }
-} catch (err) {
-  console.warn('[EMAIL] Resend failed to load. Run: npm install react react-dom');
-  console.warn('[EMAIL] Error:', err.message);
 }
 
 /* =========================
@@ -37,11 +35,11 @@ if (!process.env.MONGO_URI) {
   process.exit(1);
 }
 if (!process.env.JWT_SECRET || process.env.JWT_SECRET.includes('CHANGE_THIS')) {
-  console.warn('WARNING: JWT_SECRET is using the default placeholder. Update it in production.');
+  console.warn('WARNING: JWT_SECRET is using the default placeholder. Update .env and restart.');
 }
 
 /* =========================
-   DATABASE CONNECTION
+   DATABASE
    ========================= */
 const connectDB = async () => {
   try {
@@ -73,7 +71,6 @@ const PLATFORM_FEE_PERCENT = parseFloat(process.env.PLATFORM_FEE_PERCENT || '20'
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
 
-// Webhook logging
 const webhookLogPath = path.join(__dirname, 'webhook.log');
 function logWebhook(msg, data) {
     const line = `[${new Date().toISOString()}] ${msg} | ${JSON.stringify(data)}\n`;
@@ -361,11 +358,11 @@ async function processWebhook(data) {
    ROOT / HEALTH
    ========================= */
 app.get('/', (req, res) => {
-  res.json({ name: 'MsupaChat API', version: '3.1.0', status: 'running', timestamp: new Date().toISOString() });
+  res.json({ name: 'MsupaChat API', version: '3.1.1', status: 'running', timestamp: new Date().toISOString() });
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString(), version: '3.1.0' });
+  res.json({ status: 'OK', timestamp: new Date().toISOString(), version: '3.1.1' });
 });
 
 /* =========================
@@ -394,10 +391,10 @@ app.post('/api/auth/register', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const hashedPassword = await bcrypt.hash(password, salt);
     const user = await User.create({ name, email, password: hashedPassword });
-    if (resend) {
-      try {
-        await resend.emails.send({ from: process.env.EMAIL_FROM || 'onboarding@resend.dev', to: email, subject: 'Welcome to MsupaChat', html: `<h1>Welcome ${name}!</h1><p>Your account has been created successfully.</p>` });
-      } catch (e) { console.log('Email send failed:', e.message); }
+    const emailClient = getResend();
+    if (emailClient) {
+      try { await emailClient.emails.send({ from: process.env.EMAIL_FROM || 'onboarding@resend.dev', to: email, subject: 'Welcome to MsupaChat', html: `<h1>Welcome ${name}!</h1><p>Your account has been created successfully.</p>` }); }
+      catch (e) { console.log('Email send failed:', e.message); }
     }
     res.status(201).json({ _id: user._id, name: user.name, email: user.email, role: user.role, tier: user.tier, visibility: user.visibility, amountSpent: user.amountSpent, bio: user.bio, registrationDate: user.registrationDate, token: generateToken(user._id) });
   } catch (error) { res.status(500).json({ message: error.message }); }
@@ -421,8 +418,9 @@ app.post('/api/auth/forgot-password', async (req, res) => {
     const resetToken = jwt.sign({ id: user._id }, JWT_SECRET, { expiresIn: '1h' });
     user.resetPasswordToken = resetToken; user.resetPasswordExpires = Date.now() + 3600000; await user.save();
     const resetUrl = `${process.env.FRONTEND_URL || 'https://msupachat.com'}/reset-password?token=${resetToken}`;
-    if (resend) {
-      try { await resend.emails.send({ from: process.env.EMAIL_FROM || 'onboarding@resend.dev', to: email, subject: 'MsupaChat Password Reset', html: `<h1>Password Reset</h1><p>Click <a href="${resetUrl}">here</a> to reset.</p>` }); }
+    const emailClient = getResend();
+    if (emailClient) {
+      try { await emailClient.emails.send({ from: process.env.EMAIL_FROM || 'onboarding@resend.dev', to: email, subject: 'MsupaChat Password Reset', html: `<h1>Password Reset</h1><p>Click <a href="${resetUrl}">here</a> to reset.</p>` }); }
       catch (e) { console.log('Email send failed:', e.message); }
     }
     res.json({ message: 'Reset email sent' });
@@ -547,7 +545,7 @@ app.post('/api/apply', upload.single('photo'), async (req, res) => {
 });
 
 /* =========================
-   MEGAPAY DEPOSIT (AfroLink style)
+   MEGAPAY DEPOSIT
    ========================= */
 app.post('/api/deposit', async (req, res) => {
     try {
@@ -865,7 +863,7 @@ app.use((req, res) => {
    START SERVER
    ========================= */
 app.listen(PORT, () => {
-    console.log(`MsupaChat v3.1 API running on port ${PORT}`);
+    console.log(`MsupaChat v3.1.1 API running on port ${PORT}`);
     console.log(`Webhook URLs:`);
     console.log(`  POST ${BASE_URL}/api/webhook/megapay`);
     console.log(`  POST ${BASE_URL}/api/megapay/webhook`);
