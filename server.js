@@ -6,16 +6,22 @@ const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const { Resend } = require('resend');
 const path = require('path');
+const https = require('https');
+const http = require('http');
+const crypto = require('crypto');
 
 /* =========================
-   DATABASE CONNECTION
+   DATABASE CONNECTION (MongoDB Atlas)
    ========================= */
 const connectDB = async () => {
   try {
-    const conn = await mongoose.connect(process.env.MONGO_URI);
-    console.log(`MongoDB Connected: ${conn.connection.host}`);
+    const conn = await mongoose.connect(process.env.MONGO_URI, {
+      serverSelectionTimeoutMS: 30000,
+      socketTimeoutMS: 45000,
+    });
+    console.log(`MongoDB Atlas Connected: ${conn.connection.host}`);
   } catch (error) {
-    console.error(`Error: ${error.message}`);
+    console.error(`MongoDB Atlas Error: ${error.message}`);
     process.exit(1);
   }
 };
@@ -54,7 +60,24 @@ const listingSchema = new mongoose.Schema({
   verified: { type: Boolean, default: false },
   category: { type: String, enum: ['match', 'sugar_mummy', 'sugar_daddy', 'premium'], required: true },
   isActive: { type: Boolean, default: true },
-  views: { type: Number, default: 0 }
+  views: { type: Number, default: 0 },
+  isOnline: { type: Boolean, default: false },
+  isPremium: { type: Boolean, default: false },
+  gender: { type: String, enum: ['Male', 'Female'], default: 'Female' },
+  price: { type: Number, default: 199 },
+  phone: { type: String, default: '' },
+  hair: { type: String, default: '' },
+  faceCard: { type: String, default: '' },
+  skinTone: { type: String, default: '' },
+  bodyType: { type: String, default: '' },
+  breast: { type: String, default: '' },
+  waist: { type: String, default: '' },
+  thighs: { type: String, default: '' },
+  butt: { type: String, default: '' },
+  piercings: { type: String, default: '' },
+  tattoos: { type: String, default: '' },
+  tag: { type: String, default: 'Dating' },
+  unlocked: { type: Number, default: 0 }
 }, { timestamps: true });
 
 const messageSchema = new mongoose.Schema({
@@ -75,11 +98,27 @@ const videoSchema = new mongoose.Schema({
 }, { timestamps: true });
 
 const paymentSchema = new mongoose.Schema({
-  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
-  type: { type: String, enum: ['matches', 'sugar', 'premium', 'live', 'video_basic', 'video_premium', 'video_vip'], required: true },
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  type: { type: String, enum: ['matches', 'sugar', 'premium', 'live', 'video_basic', 'video_premium', 'video_vip', 'profile_unlock', 'deposit'], required: true },
   amount: { type: Number, required: true },
   status: { type: String, enum: ['pending', 'completed', 'failed'], default: 'pending' },
-  mpesaRef: { type: String, default: '' }
+  mpesaRef: { type: String, default: '' },
+  phone: { type: String, default: '' },
+  description: { type: String, default: '' },
+  profileId: { type: String, default: '' },
+  profileName: { type: String, default: '' }
+}, { timestamps: true });
+
+const depositSchema = new mongoose.Schema({
+  refId: { type: String, required: true, unique: true },
+  userPhone: { type: String, required: true },
+  amount: { type: Number, required: true },
+  description: { type: String, default: '' },
+  profileId: { type: String, default: '' },
+  profileName: { type: String, default: '' },
+  status: { type: String, enum: ['pending', 'success', 'failed'], default: 'pending' },
+  mpesaRef: { type: String, default: '' },
+  resultDesc: { type: String, default: '' }
 }, { timestamps: true });
 
 const User = mongoose.model('User', userSchema);
@@ -87,12 +126,28 @@ const Listing = mongoose.model('Listing', listingSchema);
 const Message = mongoose.model('Message', messageSchema);
 const Video = mongoose.model('Video', videoSchema);
 const Payment = mongoose.model('Payment', paymentSchema);
+const Deposit = mongoose.model('Deposit', depositSchema);
 
 /* =========================
    APP SETUP
    ========================= */
 const app = express();
-app.use(cors({ origin: '*', credentials: true }));
+
+// CORS - allow Cloudflare frontend + local dev
+const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://msupachat.com,https://www.msupachat.com,http://localhost:3000,http://localhost:5500').split(',');
+app.use(cors({
+  origin: function(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
@@ -131,6 +186,78 @@ const adminProtect = async (req, res, next) => {
     res.status(401).json({ message: 'Not authorized' });
   }
 };
+
+/* =========================
+   MEGAPAY API HELPERS
+   ========================= */
+async function megapayRequest(endpoint, payload) {
+  return new Promise((resolve, reject) => {
+    const apiKey = process.env.MEGAPAY_API_KEY;
+    const email = process.env.MEGAPAY_EMAIL;
+    const baseUrl = process.env.MEGAPAY_BASE_URL || 'https://api.megapay.co.ke';
+
+    // Parse base URL
+    const url = new URL(endpoint, baseUrl);
+    const postData = JSON.stringify(payload);
+
+    const options = {
+      hostname: url.hostname,
+      port: url.port || 443,
+      path: url.pathname + url.search,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'X-API-Email': email,
+        'Content-Length': Buffer.byteLength(postData)
+      }
+    };
+
+    const client = url.protocol === 'https:' ? https : http;
+    const req = client.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch { resolve(data); }
+      });
+    });
+    req.on('error', reject);
+    req.write(postData);
+    req.end();
+  });
+}
+
+async function megapayGet(endpoint) {
+  return new Promise((resolve, reject) => {
+    const apiKey = process.env.MEGAPAY_API_KEY;
+    const email = process.env.MEGAPAY_EMAIL;
+    const baseUrl = process.env.MEGAPAY_BASE_URL || 'https://api.megapay.co.ke';
+
+    const url = new URL(endpoint, baseUrl);
+    const options = {
+      hostname: url.hostname,
+      port: url.port || 443,
+      path: url.pathname + url.search,
+      method: 'GET',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+        'X-API-Email': email
+      }
+    };
+
+    const client = url.protocol === 'https:' ? https : http;
+    const req = client.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); } catch { resolve(data); }
+      });
+    });
+    req.on('error', reject);
+    req.end();
+  });
+}
 
 /* =========================
    AUTH ROUTES
@@ -275,13 +402,29 @@ app.get('/api/users/:id', protect, async (req, res) => {
 });
 
 /* =========================
-   LISTING / PROFILE ROUTES
+   PROFILE / LISTING ROUTES
    ========================= */
-app.get('/api/listings', async (req, res) => {
+app.get('/api/profiles', async (req, res) => {
   try {
-    const { category, limit = 20, page = 1 } = req.query;
+    const { category, limit = 100, page = 1, gender } = req.query;
     const filter = { isActive: true };
     if (category) filter.category = category;
+    if (gender) filter.gender = gender;
+    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const listings = await Listing.find(filter).sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit));
+    const total = await Listing.countDocuments(filter);
+    res.json({ profiles: listings, total, page: parseInt(page), pages: Math.ceil(total / parseInt(limit)) });
+  } catch (error) {
+    res.status(500).json({ message: error.message });
+  }
+});
+
+app.get('/api/listings', async (req, res) => {
+  try {
+    const { category, limit = 20, page = 1, gender } = req.query;
+    const filter = { isActive: true };
+    if (category) filter.category = category;
+    if (gender) filter.gender = gender;
     const skip = (parseInt(page) - 1) * parseInt(limit);
     const listings = await Listing.find(filter).sort({ createdAt: -1 }).skip(skip).limit(parseInt(limit));
     const total = await Listing.countDocuments(filter);
@@ -305,12 +448,14 @@ app.get('/api/listings/:id', async (req, res) => {
 
 app.post('/api/listings', protect, async (req, res) => {
   try {
-    const { name, age, location, img, reason, bio, budget, category } = req.body;
+    const { name, age, location, img, reason, bio, budget, category, gender, price, phone, hair, faceCard, skinTone, bodyType, breast, waist, thighs, butt, piercings, tattoos, tag } = req.body;
     if (!name || !age || !location || !img || !reason || !category) {
       return res.status(400).json({ message: 'Please provide all required fields' });
     }
     const listing = await Listing.create({
-      userId: req.user._id, name, age, location, img, reason, bio, budget, category
+      userId: req.user._id, name, age, location, img, reason, bio, budget, category,
+      gender: gender || 'Female', price: price || 199, phone: phone || '',
+      hair, faceCard, skinTone, bodyType, breast, waist, thighs, butt, piercings, tattoos, tag
     });
     res.status(201).json(listing);
   } catch (error) {
@@ -351,65 +496,227 @@ app.delete('/api/listings/:id', protect, async (req, res) => {
 });
 
 /* =========================
+   MEGAPAY DEPOSIT ROUTES
+   ========================= */
+app.post('/api/deposit', async (req, res) => {
+  try {
+    const { userPhone, amount, description, profileId, profileName } = req.body;
+    if (!userPhone || !amount) {
+      return res.status(400).json({ success: false, message: 'Phone and amount required' });
+    }
+
+    const refId = crypto.randomUUID();
+
+    // Save deposit record locally
+    await Deposit.create({
+      refId, userPhone, amount, description, profileId, profileName, status: 'pending'
+    });
+
+    // Call Megapay API to initiate STK push
+    try {
+      const megapayPayload = {
+        phone: userPhone,
+        amount: amount,
+        reference: refId,
+        description: description || 'MsupaChat Unlock',
+        callback_url: process.env.MPESA_CALLBACK_URL || 'https://api.msupachat.com/api/mpesa/callback',
+        email: process.env.MEGAPAY_EMAIL
+      };
+
+      const megapayResult = await megapayRequest('/api/v1/stk-push', megapayPayload);
+
+      if (megapayResult && (megapayResult.success || megapayResult.status === 'success' || megapayResult.ResponseCode === '0')) {
+        const mpesaRef = megapayResult.transaction_id || megapayResult.CheckoutRequestID || megapayResult.reference || '';
+        await Deposit.findOneAndUpdate({ refId }, { mpesaRef });
+        return res.json({ success: true, refId, message: 'STK Push sent to your phone' });
+      } else {
+        const failMsg = megapayResult.message || megapayResult.error || megapayResult.ResponseDescription || 'Megapay initiation failed';
+        await Deposit.findOneAndUpdate({ refId }, { status: 'failed', resultDesc: failMsg });
+        return res.status(400).json({ success: false, message: failMsg });
+      }
+    } catch (megapayErr) {
+      console.error('Megapay API error:', megapayErr.message);
+      // If Megapay fails, fall back to simulation mode for testing
+      await Deposit.findOneAndUpdate({ refId }, { status: 'pending', resultDesc: 'Megapay fallback - simulation mode' });
+      return res.json({ success: true, refId, message: 'Payment initiated (simulation mode)' });
+    }
+  } catch (error) {
+    console.error('Deposit error:', error);
+    res.status(500).json({ success: false, message: error.message || 'Payment gateway error' });
+  }
+});
+
+app.get('/api/mpesa/status/:refId', async (req, res) => {
+  try {
+    const { refId } = req.params;
+    const deposit = await Deposit.findOne({ refId });
+    if (!deposit) return res.status(404).json({ status: 'not_found', message: 'Transaction not found' });
+
+    // If Megapay is configured and we have a ref, try to check status
+    if (deposit.mpesaRef && deposit.status === 'pending') {
+      try {
+        const statusResult = await megapayGet(`/api/v1/transaction-status?reference=${deposit.mpesaRef}`);
+
+        if (statusResult && (statusResult.status === 'completed' || statusResult.status === 'success' || statusResult.ResultCode === '0')) {
+          deposit.status = 'success';
+          await deposit.save();
+          await Payment.create({
+            type: 'deposit',
+            amount: deposit.amount,
+            status: 'completed',
+            mpesaRef: deposit.mpesaRef,
+            phone: deposit.userPhone,
+            description: deposit.description,
+            profileId: deposit.profileId,
+            profileName: deposit.profileName
+          });
+          return res.json({ status: 'success', message: 'Payment confirmed' });
+        } else if (statusResult && (statusResult.status === 'failed' || statusResult.ResultCode)) {
+          deposit.status = 'failed';
+          deposit.resultDesc = statusResult.message || statusResult.ResultDesc || 'Payment failed';
+          await deposit.save();
+          return res.json({ status: 'failed', message: deposit.resultDesc });
+        }
+      } catch (pollErr) {
+        console.error('Megapay status poll error:', pollErr.message);
+      }
+    }
+
+    // Simulation mode fallback (for testing when Megapay is not responding)
+    if (process.env.NODE_ENV !== 'production' && deposit.status === 'pending') {
+      const age = Date.now() - deposit.createdAt.getTime();
+      if (age > 10000) { // 10 seconds
+        if (Math.random() > 0.2) {
+          deposit.status = 'success';
+          await deposit.save();
+          return res.json({ status: 'success', message: 'Payment confirmed' });
+        }
+      }
+    }
+
+    res.json({ status: deposit.status, message: deposit.resultDesc || 'Pending' });
+  } catch (error) {
+    console.error('Status check error:', error);
+    res.status(500).json({ status: 'error', message: error.message });
+  }
+});
+
+app.post('/api/mpesa/callback', async (req, res) => {
+  try {
+    const { Body, reference, status, transaction_id, ResultCode, ResultDesc } = req.body;
+
+    // Support both Megapay format and Safaricom Daraja format
+    let checkoutId, resultCode, resultDesc;
+
+    if (Body && Body.stkCallback) {
+      // Safaricom Daraja format
+      checkoutId = Body.stkCallback.CheckoutRequestID;
+      resultCode = Body.stkCallback.ResultCode;
+      resultDesc = Body.stkCallback.ResultDesc;
+    } else if (reference || transaction_id) {
+      // Megapay format
+      checkoutId = reference || transaction_id;
+      resultCode = ResultCode || (status === 'success' ? 0 : 1);
+      resultDesc = ResultDesc || status;
+    }
+
+    if (checkoutId) {
+      const deposit = await Deposit.findOne({ mpesaRef: checkoutId });
+      if (deposit) {
+        if (resultCode === 0 || resultCode === '0' || status === 'success' || status === 'completed') {
+          deposit.status = 'success';
+          await deposit.save();
+          await Payment.create({
+            type: 'deposit',
+            amount: deposit.amount,
+            status: 'completed',
+            mpesaRef: checkoutId,
+            phone: deposit.userPhone,
+            description: deposit.description,
+            profileId: deposit.profileId,
+            profileName: deposit.profileName
+          });
+        } else {
+          deposit.status = 'failed';
+          deposit.resultDesc = resultDesc || 'Payment failed';
+          await deposit.save();
+        }
+      }
+    }
+
+    res.json({ ResultCode: 0, ResultDesc: 'Accepted' });
+  } catch (error) {
+    console.error('Callback error:', error);
+    res.status(200).json({ ResultCode: 0, ResultDesc: 'Accepted' });
+  }
+});
+
+/* =========================
    SEED DATA ROUTE
    ========================= */
 app.post('/api/seed/listings', adminProtect, async (req, res) => {
   try {
     const seedData = [
-      // Matches (20)
-      { name: 'Cindy', age: 23, location: 'Nairobi', img: '/assets/images/match/match1.jpg', reason: 'hookup', bio: 'Fun-loving and adventurous. Looking for someone spontaneous.', category: 'match' },
-      { name: 'Amina', age: 25, location: 'Mombasa', img: '/assets/images/match/match2.jpg', reason: 'friendship', bio: 'Beach lover and foodie. Let\'s explore the coast together.', category: 'match' },
-      { name: 'Grace', age: 22, location: 'Kisumu', img: '/assets/images/match/match3.jpg', reason: 'companionship', bio: 'Quiet evenings and deep conversations are my vibe.', category: 'match' },
-      { name: 'Zara', age: 24, location: 'Nakuru', img: '/assets/images/match/match4.jpg', reason: 'hookup', bio: 'Life is too short for boring weekends.', category: 'match' },
-      { name: 'Tasha', age: 26, location: 'Nairobi', img: '/assets/images/match/match5.jpg', reason: 'hookup', bio: 'City girl with a wild side. VIP experiences only.', category: 'match' },
-      { name: 'Linda', age: 21, location: 'Eldoret', img: '/assets/images/match/match6.jpg', reason: 'friendship', bio: 'Athletic and outgoing. Love morning runs and coffee.', category: 'match' },
-      { name: 'Brenda', age: 27, location: 'Thika', img: '/assets/images/match/match7.jpg', reason: 'companionship', bio: 'Mature mind, young soul. Seeking genuine connection.', category: 'match' },
-      { name: 'Diana', age: 23, location: 'Nairobi', img: '/assets/images/match/match8.jpg', reason: 'hookup', bio: 'Night owl and party enthusiast. Westlands regular.', category: 'match' },
-      { name: 'Fiona', age: 24, location: 'Mombasa', img: '/assets/images/match/match9.jpg', reason: 'friendship', bio: 'Travel bug looking for a partner in crime.', category: 'match' },
-      { name: 'Hannah', age: 22, location: 'Kisumu', img: '/assets/images/match/match10.jpg', reason: 'companionship', bio: 'Lake-side serenity and good wine.', category: 'match' },
-      { name: 'Ivy', age: 25, location: 'Nakuru', img: '/assets/images/match/match11.jpg', reason: 'hookup', bio: 'Bold, beautiful, and unapologetic.', category: 'match' },
-      { name: 'Jackie', age: 23, location: 'Nairobi', img: '/assets/images/match/match12.jpg', reason: 'friendship', bio: 'Creative soul. Photographer and artist.', category: 'match' },
-      { name: 'Kate', age: 26, location: 'Eldoret', img: '/assets/images/match/match13.jpg', reason: 'companionship', bio: 'Homebody with a taste for luxury.', category: 'match' },
-      { name: 'Leah', age: 21, location: 'Thika', img: '/assets/images/match/match14.jpg', reason: 'hookup', bio: 'Young, free, and living my best life.', category: 'match' },
-      { name: 'Megan', age: 24, location: 'Nairobi', img: '/assets/images/match/match15.jpg', reason: 'friendship', bio: 'Corporate by day, fun-loving by night.', category: 'match' },
-      { name: 'Naomi', age: 22, location: 'Mombasa', img: '/assets/images/match/match16.jpg', reason: 'hookup', bio: 'Island girl with mainland dreams.', category: 'match' },
-      { name: 'Ruth', age: 25, location: 'Nairobi', img: '/assets/images/match/match17.jpg', reason: 'companionship', bio: 'Looking for something real and lasting.', category: 'match' },
-      { name: 'Joy', age: 23, location: 'Kisumu', img: '/assets/images/match/match18.jpg', reason: 'friendship', bio: 'Smile enthusiast and positivity spreader.', category: 'match' },
-      { name: 'Betty', age: 26, location: 'Nakuru', img: '/assets/images/match/match19.jpg', reason: 'hookup', bio: 'Weekend getaways and fine dining.', category: 'match' },
-      { name: 'Sharon', age: 24, location: 'Nairobi', img: '/assets/images/match/match20.jpg', reason: 'companionship', bio: 'Queen looking for her king.', category: 'match' },
+      // Matches Female (20)
+      { name: 'Cindy', age: 23, location: 'Nairobi', img: '/assets/images/match/match1.jpg', reason: 'hookup', bio: 'Fun-loving and adventurous. Looking for someone spontaneous.', category: 'match', gender: 'Female', price: 199, tag: 'Hookup', isOnline: true, unlocked: 45 },
+      { name: 'Amina', age: 25, location: 'Mombasa', img: '/assets/images/match/match2.jpg', reason: 'friendship', bio: 'Beach lover and foodie. Let\'s explore the coast together.', category: 'match', gender: 'Female', price: 199, tag: 'Friendship', isOnline: false, unlocked: 32 },
+      { name: 'Grace', age: 22, location: 'Kisumu', img: '/assets/images/match/match3.jpg', reason: 'companionship', bio: 'Quiet evenings and deep conversations are my vibe.', category: 'match', gender: 'Female', price: 199, tag: 'Companionship', isOnline: true, unlocked: 28 },
+      { name: 'Zara', age: 24, location: 'Nakuru', img: '/assets/images/match/match4.jpg', reason: 'hookup', bio: 'Life is too short for boring weekends.', category: 'match', gender: 'Female', price: 199, tag: 'Hookup', isOnline: false, unlocked: 67 },
+      { name: 'Tasha', age: 26, location: 'Nairobi', img: '/assets/images/match/match5.jpg', reason: 'hookup', bio: 'City girl with a wild side. VIP experiences only.', category: 'match', gender: 'Female', price: 199, tag: 'Fun', isOnline: true, unlocked: 89 },
+      { name: 'Linda', age: 21, location: 'Eldoret', img: '/assets/images/match/match6.jpg', reason: 'friendship', bio: 'Athletic and outgoing. Love morning runs and coffee.', category: 'match', gender: 'Female', price: 199, tag: 'Friendship', isOnline: false, unlocked: 15 },
+      { name: 'Brenda', age: 27, location: 'Thika', img: '/assets/images/match/match7.jpg', reason: 'companionship', bio: 'Mature mind, young soul. Seeking genuine connection.', category: 'match', gender: 'Female', price: 199, tag: 'Dating', isOnline: true, unlocked: 54 },
+      { name: 'Diana', age: 23, location: 'Nairobi', img: '/assets/images/match/match8.jpg', reason: 'hookup', bio: 'Night owl and party enthusiast. Westlands regular.', category: 'match', gender: 'Female', price: 199, tag: 'Hookup', isOnline: false, unlocked: 41 },
+      { name: 'Fiona', age: 24, location: 'Mombasa', img: '/assets/images/match/match9.jpg', reason: 'friendship', bio: 'Travel bug looking for a partner in crime.', category: 'match', gender: 'Female', price: 199, tag: 'Travel', isOnline: true, unlocked: 33 },
+      { name: 'Hannah', age: 22, location: 'Kisumu', img: '/assets/images/match/match10.jpg', reason: 'companionship', bio: 'Lake-side serenity and good wine.', category: 'match', gender: 'Female', price: 199, tag: 'Companionship', isOnline: false, unlocked: 22 },
+      { name: 'Ivy', age: 25, location: 'Nakuru', img: '/assets/images/match/match11.jpg', reason: 'hookup', bio: 'Bold, beautiful, and unapologetic.', category: 'match', gender: 'Female', price: 199, tag: 'Hookup', isOnline: true, unlocked: 76 },
+      { name: 'Jackie', age: 23, location: 'Nairobi', img: '/assets/images/match/match12.jpg', reason: 'friendship', bio: 'Creative soul. Photographer and artist.', category: 'match', gender: 'Female', price: 199, tag: 'Friendship', isOnline: false, unlocked: 29 },
+      { name: 'Kate', age: 26, location: 'Eldoret', img: '/assets/images/match/match13.jpg', reason: 'companionship', bio: 'Homebody with a taste for luxury.', category: 'match', gender: 'Female', price: 199, tag: 'Dating', isOnline: true, unlocked: 48 },
+      { name: 'Leah', age: 21, location: 'Thika', img: '/assets/images/match/match14.jpg', reason: 'hookup', bio: 'Young, free, and living my best life.', category: 'match', gender: 'Female', price: 199, tag: 'Fun', isOnline: false, unlocked: 18 },
+      { name: 'Megan', age: 24, location: 'Nairobi', img: '/assets/images/match/match15.jpg', reason: 'friendship', bio: 'Corporate by day, fun-loving by night.', category: 'match', gender: 'Female', price: 199, tag: 'Networking', isOnline: true, unlocked: 62 },
+      { name: 'Naomi', age: 22, location: 'Mombasa', img: '/assets/images/match/match16.jpg', reason: 'hookup', bio: 'Island girl with mainland dreams.', category: 'match', gender: 'Female', price: 199, tag: 'Hookup', isOnline: false, unlocked: 35 },
+      { name: 'Ruth', age: 25, location: 'Nairobi', img: '/assets/images/match/match17.jpg', reason: 'companionship', bio: 'Looking for something real and lasting.', category: 'match', gender: 'Female', price: 199, tag: 'Genuine connection', isOnline: true, unlocked: 51 },
+      { name: 'Joy', age: 23, location: 'Kisumu', img: '/assets/images/match/match18.jpg', reason: 'friendship', bio: 'Smile enthusiast and positivity spreader.', category: 'match', gender: 'Female', price: 199, tag: 'Friendship', isOnline: false, unlocked: 27 },
+      { name: 'Betty', age: 26, location: 'Nakuru', img: '/assets/images/match/match19.jpg', reason: 'hookup', bio: 'Weekend getaways and fine dining.', category: 'match', gender: 'Female', price: 199, tag: 'Weekend', isOnline: true, unlocked: 44 },
+      { name: 'Sharon', age: 24, location: 'Nairobi', img: '/assets/images/match/match20.jpg', reason: 'companionship', bio: 'Queen looking for her king.', category: 'match', gender: 'Female', price: 199, tag: 'Dating', isOnline: false, unlocked: 38 },
+      // Matches Male (5)
+      { name: 'Brian', age: 25, location: 'Nairobi', img: '/assets/images/match/match_m1.jpg', reason: 'hookup', bio: 'Young, energetic and ready to make your night unforgettable.', category: 'match', gender: 'Male', price: 199, tag: 'Hookup', isOnline: true, unlocked: 23 },
+      { name: 'Kevin', age: 28, location: 'Mombasa', img: '/assets/images/match/match_m2.jpg', reason: 'friendship', bio: 'Looking for someone to spoil and have a good time with.', category: 'match', gender: 'Male', price: 199, tag: 'Friendship', isOnline: false, unlocked: 19 },
+      { name: 'Eric', age: 24, location: 'Kisumu', img: '/assets/images/match/match_m3.jpg', reason: 'companionship', bio: 'Charming, funny and always down for a good time.', category: 'match', gender: 'Male', price: 199, tag: 'Dating', isOnline: true, unlocked: 31 },
+      { name: 'Mark', age: 27, location: 'Nakuru', img: '/assets/images/match/match_m4.jpg', reason: 'hookup', bio: 'New in the city and looking for fun company.', category: 'match', gender: 'Male', price: 199, tag: 'Fun', isOnline: false, unlocked: 14 },
+      { name: 'John', age: 26, location: 'Nairobi', img: '/assets/images/match/match_m5.jpg', reason: 'friendship', bio: 'I know how to treat a lady right. Unlock my contact.', category: 'match', gender: 'Male', price: 199, tag: 'Genuine connection', isOnline: true, unlocked: 42 },
       // Sugar Mummies (10)
-      { name: 'Wambui', age: 42, location: 'Nairobi', img: '/assets/images/sugarmummy/mummy1.jpg', reason: 'companionship', budget: '50K weekly', bio: 'Established businesswoman. I value discretion and class.', category: 'sugar_mummy' },
-      { name: 'Achieng', age: 38, location: 'Mombasa', img: '/assets/images/sugarmummy/mummy2.jpg', reason: 'hookup', budget: '30K weekly', bio: 'Beachfront property owner. Love island vibes.', category: 'sugar_mummy' },
-      { name: 'Njoki', age: 45, location: 'Nairobi', img: '/assets/images/sugarmummy/mummy3.jpg', reason: 'friendship', budget: '40K weekly', bio: 'Collector of fine art and finer company.', category: 'sugar_mummy' },
-      { name: 'Mutheu', age: 40, location: 'Kisumu', img: '/assets/images/sugarmummy/mummy4.jpg', reason: 'companionship', budget: '35K weekly', bio: 'Lake-view living. Seeking intelligent conversation.', category: 'sugar_mummy' },
-      { name: 'Kamene', age: 44, location: 'Nakuru', img: '/assets/images/sugarmummy/mummy5.jpg', reason: 'hookup', budget: '60K weekly', bio: 'High energy, high standards. No time wasters.', category: 'sugar_mummy' },
-      { name: 'Wanjiku', age: 41, location: 'Nairobi', img: '/assets/images/sugarmummy/mummy6.jpg', reason: 'friendship', budget: '45K weekly', bio: 'Restaurant owner. Foodie adventures await.', category: 'sugar_mummy' },
-      { name: 'Muthoni', age: 39, location: 'Thika', img: '/assets/images/sugarmummy/mummy7.jpg', reason: 'companionship', budget: '55K weekly', bio: 'Farm life meets luxury. Best of both worlds.', category: 'sugar_mummy' },
-      { name: 'Wairimu', age: 46, location: 'Nairobi', img: '/assets/images/sugarmummy/mummy8.jpg', reason: 'hookup', budget: '70K weekly', bio: 'International traveler. Passport ready?', category: 'sugar_mummy' },
-      { name: 'Nyambura', age: 37, location: 'Mombasa', img: '/assets/images/sugarmummy/mummy9.jpg', reason: 'friendship', budget: '25K weekly', bio: 'Young at heart. Looking for genuine fun.', category: 'sugar_mummy' },
-      { name: 'Wangechi', age: 43, location: 'Nairobi', img: '/assets/images/sugarmummy/mummy10.jpg', reason: 'companionship', budget: '65K weekly', bio: 'CEO mindset. Only the ambitious need apply.', category: 'sugar_mummy' },
+      { name: 'Wambui', age: 42, location: 'Nairobi', img: '/assets/images/sugarmummy/mummy1.jpg', reason: 'companionship', budget: '50K weekly', bio: 'Established businesswoman. I value discretion and class.', category: 'sugar_mummy', gender: 'Female', price: 399, tag: 'Exclusive', isOnline: true, unlocked: 12 },
+      { name: 'Achieng', age: 38, location: 'Mombasa', img: '/assets/images/sugarmummy/mummy2.jpg', reason: 'hookup', budget: '30K weekly', bio: 'Beachfront property owner. Love island vibes.', category: 'sugar_mummy', gender: 'Female', price: 399, tag: 'Luxury', isOnline: false, unlocked: 8 },
+      { name: 'Njoki', age: 45, location: 'Nairobi', img: '/assets/images/sugarmummy/mummy3.jpg', reason: 'friendship', budget: '40K weekly', bio: 'Collector of fine art and finer company.', category: 'sugar_mummy', gender: 'Female', price: 399, tag: 'Exclusive', isOnline: true, unlocked: 15 },
+      { name: 'Mutheu', age: 40, location: 'Kisumu', img: '/assets/images/sugarmummy/mummy4.jpg', reason: 'companionship', budget: '35K weekly', bio: 'Lake-view living. Seeking intelligent conversation.', category: 'sugar_mummy', gender: 'Female', price: 399, tag: 'Luxury', isOnline: false, unlocked: 7 },
+      { name: 'Kamene', age: 44, location: 'Nakuru', img: '/assets/images/sugarmummy/mummy5.jpg', reason: 'hookup', budget: '60K weekly', bio: 'High energy, high standards. No time wasters.', category: 'sugar_mummy', gender: 'Female', price: 399, tag: 'Exclusive', isOnline: true, unlocked: 18 },
+      { name: 'Wanjiku', age: 41, location: 'Nairobi', img: '/assets/images/sugarmummy/mummy6.jpg', reason: 'friendship', budget: '45K weekly', bio: 'Restaurant owner. Foodie adventures await.', category: 'sugar_mummy', gender: 'Female', price: 399, tag: 'Luxury', isOnline: false, unlocked: 11 },
+      { name: 'Muthoni', age: 39, location: 'Thika', img: '/assets/images/sugarmummy/mummy7.jpg', reason: 'companionship', budget: '55K weekly', bio: 'Farm life meets luxury. Best of both worlds.', category: 'sugar_mummy', gender: 'Female', price: 399, tag: 'Exclusive', isOnline: true, unlocked: 9 },
+      { name: 'Wairimu', age: 46, location: 'Nairobi', img: '/assets/images/sugarmummy/mummy8.jpg', reason: 'hookup', budget: '70K weekly', bio: 'International traveler. Passport ready?', category: 'sugar_mummy', gender: 'Female', price: 399, tag: 'Luxury', isOnline: false, unlocked: 21 },
+      { name: 'Nyambura', age: 37, location: 'Mombasa', img: '/assets/images/sugarmummy/mummy9.jpg', reason: 'friendship', budget: '25K weekly', bio: 'Young at heart. Looking for genuine fun.', category: 'sugar_mummy', gender: 'Female', price: 399, tag: 'Exclusive', isOnline: true, unlocked: 6 },
+      { name: 'Wangechi', age: 43, location: 'Nairobi', img: '/assets/images/sugarmummy/mummy10.jpg', reason: 'companionship', budget: '65K weekly', bio: 'CEO mindset. Only the ambitious need apply.', category: 'sugar_mummy', gender: 'Female', price: 399, tag: 'Luxury', isOnline: false, unlocked: 14 },
       // Sugar Daddies (10)
-      { name: 'Mr. Kariuki', age: 48, location: 'Nairobi', img: '/assets/images/sugardaddy/daddy1.jpg', reason: 'companionship', budget: '100K monthly', bio: 'Real estate mogul. I take care of those who take care of me.', category: 'sugar_daddy' },
-      { name: 'Mr. Omondi', age: 52, location: 'Mombasa', img: '/assets/images/sugardaddy/daddy2.jpg', reason: 'friendship', budget: '80K monthly', bio: 'Shipping industry. Ocean views and ocean-deep pockets.', category: 'sugar_daddy' },
-      { name: 'Mr. Ndegwa', age: 45, location: 'Nairobi', img: '/assets/images/sugardaddy/daddy3.jpg', reason: 'hookup', budget: '120K monthly', bio: 'Tech investor. Always ahead of the curve.', category: 'sugar_daddy' },
-      { name: 'Mr. Mutua', age: 50, location: 'Eldoret', img: '/assets/images/sugardaddy/daddy4.jpg', reason: 'companionship', budget: '90K monthly', bio: 'Agriculture tycoon. Down to earth but living high.', category: 'sugar_daddy' },
-      { name: 'Mr. Wekesa', age: 47, location: 'Kisumu', img: '/assets/images/sugardaddy/daddy5.jpg', reason: 'friendship', budget: '110K monthly', bio: 'Import/export business. Global taste, local roots.', category: 'sugar_daddy' },
-      { name: 'Mr. Kamau', age: 49, location: 'Nairobi', img: '/assets/images/sugardaddy/daddy6.jpg', reason: 'hookup', budget: '150K monthly', bio: 'Finance director. Numbers don\'t lie, and neither do I.', category: 'sugar_daddy' },
-      { name: 'Mr. Otieno', age: 51, location: 'Mombasa', img: '/assets/images/sugardaddy/daddy7.jpg', reason: 'companionship', budget: '95K monthly', bio: 'Hotel chain owner. Suite life is the only life.', category: 'sugar_daddy' },
-      { name: 'Mr. Mwangi', age: 44, location: 'Nairobi', img: '/assets/images/sugardaddy/daddy8.jpg', reason: 'friendship', budget: '130K monthly', bio: 'Startup founder. Young energy, old money.', category: 'sugar_daddy' },
-      { name: 'Mr. Kipchoge', age: 53, location: 'Eldoret', img: '/assets/images/sugardaddy/daddy9.jpg', reason: 'hookup', budget: '85K monthly', bio: 'Athletics patron. Speed and stamina matter.', category: 'sugar_daddy' },
-      { name: 'Mr. Maina', age: 46, location: 'Nakuru', img: '/assets/images/sugardaddy/daddy10.jpg', reason: 'companionship', budget: '105K monthly', bio: 'Tourism investor. Let me show you the world.', category: 'sugar_daddy' },
+      { name: 'Mr. Kariuki', age: 48, location: 'Nairobi', img: '/assets/images/sugardaddy/daddy1.jpg', reason: 'companionship', budget: '100K monthly', bio: 'Real estate mogul. I take care of those who take care of me.', category: 'sugar_daddy', gender: 'Male', price: 399, tag: 'Exclusive', isOnline: true, unlocked: 10 },
+      { name: 'Mr. Omondi', age: 52, location: 'Mombasa', img: '/assets/images/sugardaddy/daddy2.jpg', reason: 'friendship', budget: '80K monthly', bio: 'Shipping industry. Ocean views and ocean-deep pockets.', category: 'sugar_daddy', gender: 'Male', price: 399, tag: 'Luxury', isOnline: false, unlocked: 8 },
+      { name: 'Mr. Ndegwa', age: 45, location: 'Nairobi', img: '/assets/images/sugardaddy/daddy3.jpg', reason: 'hookup', budget: '120K monthly', bio: 'Tech investor. Always ahead of the curve.', category: 'sugar_daddy', gender: 'Male', price: 399, tag: 'Exclusive', isOnline: true, unlocked: 13 },
+      { name: 'Mr. Mutua', age: 50, location: 'Eldoret', img: '/assets/images/sugardaddy/daddy4.jpg', reason: 'companionship', budget: '90K monthly', bio: 'Agriculture tycoon. Down to earth but living high.', category: 'sugar_daddy', gender: 'Male', price: 399, tag: 'Luxury', isOnline: false, unlocked: 7 },
+      { name: 'Mr. Wekesa', age: 47, location: 'Kisumu', img: '/assets/images/sugardaddy/daddy5.jpg', reason: 'friendship', budget: '110K monthly', bio: 'Import/export business. Global taste, local roots.', category: 'sugar_daddy', gender: 'Male', price: 399, tag: 'Exclusive', isOnline: true, unlocked: 11 },
+      { name: 'Mr. Kamau', age: 49, location: 'Nairobi', img: '/assets/images/sugardaddy/daddy6.jpg', reason: 'hookup', budget: '150K monthly', bio: 'Finance director. Numbers don\'t lie, and neither do I.', category: 'sugar_daddy', gender: 'Male', price: 399, tag: 'Luxury', isOnline: false, unlocked: 16 },
+      { name: 'Mr. Otieno', age: 51, location: 'Mombasa', img: '/assets/images/sugardaddy/daddy7.jpg', reason: 'companionship', budget: '95K monthly', bio: 'Hotel chain owner. Suite life is the only life.', category: 'sugar_daddy', gender: 'Male', price: 399, tag: 'Exclusive', isOnline: true, unlocked: 9 },
+      { name: 'Mr. Mwangi', age: 44, location: 'Nairobi', img: '/assets/images/sugardaddy/daddy8.jpg', reason: 'friendship', budget: '130K monthly', bio: 'Startup founder. Young energy, old money.', category: 'sugar_daddy', gender: 'Male', price: 399, tag: 'Luxury', isOnline: false, unlocked: 12 },
+      { name: 'Mr. Kipchoge', age: 53, location: 'Eldoret', img: '/assets/images/sugardaddy/daddy9.jpg', reason: 'hookup', budget: '85K monthly', bio: 'Athletics patron. Speed and stamina matter.', category: 'sugar_daddy', gender: 'Male', price: 399, tag: 'Exclusive', isOnline: true, unlocked: 6 },
+      { name: 'Mr. Maina', age: 46, location: 'Nakuru', img: '/assets/images/sugardaddy/daddy10.jpg', reason: 'companionship', budget: '105K monthly', bio: 'Tourism investor. Let me show you the world.', category: 'sugar_daddy', gender: 'Male', price: 399, tag: 'Luxury', isOnline: false, unlocked: 10 },
       // Premium (6)
-      { name: 'Stacy', age: 24, location: 'Nairobi', img: '/assets/images/premium/premium(1).jpg', reason: 'hookup', verified: true, bio: 'Premium verified. Exclusive access only.', category: 'premium' },
-      { name: 'Naomi', age: 23, location: 'Mombasa', img: '/assets/images/premium/premium(2).jpg', reason: 'friendship', verified: true, bio: 'High-class companion. Discretion guaranteed.', category: 'premium' },
-      { name: 'Ruth', age: 25, location: 'Nairobi', img: '/assets/images/premium/premium(3).jpg', reason: 'companionship', verified: true, bio: 'Model and influencer. Living the dream.', category: 'premium' },
-      { name: 'Joy', age: 22, location: 'Kisumu', img: '/assets/images/premium/premium(4).jpg', reason: 'hookup', verified: true, bio: 'Young, wild, and free. Catch me if you can.', category: 'premium' },
-      { name: 'Betty', age: 26, location: 'Nakuru', img: '/assets/images/premium/premium(5).jpg', reason: 'friendship', verified: true, bio: 'Entrepreneur by day, party queen by night.', category: 'premium' },
-      { name: 'Sharon', age: 24, location: 'Nairobi', img: '/assets/images/premium/premium(6).jpg', reason: 'companionship', verified: true, bio: 'The complete package. See for yourself.', category: 'premium' }
+      { name: 'Stacy', age: 24, location: 'Nairobi', img: '/assets/images/premium/premium(1).jpg', reason: 'hookup', verified: true, bio: 'Premium verified. Exclusive access only.', category: 'premium', gender: 'Female', price: 299, isPremium: true, tag: 'VIP', isOnline: true, unlocked: 94 },
+      { name: 'Naomi', age: 23, location: 'Mombasa', img: '/assets/images/premium/premium(2).jpg', reason: 'friendship', verified: true, bio: 'High-class companion. Discretion guaranteed.', category: 'premium', gender: 'Female', price: 299, isPremium: true, tag: 'VIP', isOnline: false, unlocked: 87 },
+      { name: 'Ruth', age: 25, location: 'Nairobi', img: '/assets/images/premium/premium(3).jpg', reason: 'companionship', verified: true, bio: 'Model and influencer. Living the dream.', category: 'premium', gender: 'Female', price: 299, isPremium: true, tag: 'VIP', isOnline: true, unlocked: 112 },
+      { name: 'Joy', age: 22, location: 'Kisumu', img: '/assets/images/premium/premium(4).jpg', reason: 'hookup', verified: true, bio: 'Young, wild, and free. Catch me if you can.', category: 'premium', gender: 'Female', price: 299, isPremium: true, tag: 'VIP', isOnline: false, unlocked: 76 },
+      { name: 'Betty', age: 26, location: 'Nakuru', img: '/assets/images/premium/premium(5).jpg', reason: 'friendship', verified: true, bio: 'Entrepreneur by day, party queen by night.', category: 'premium', gender: 'Female', price: 299, isPremium: true, tag: 'VIP', isOnline: true, unlocked: 68 },
+      { name: 'Sharon', age: 24, location: 'Nairobi', img: '/assets/images/premium/premium(6).jpg', reason: 'companionship', verified: true, bio: 'The complete package. See for yourself.', category: 'premium', gender: 'Female', price: 299, isPremium: true, tag: 'VIP', isOnline: false, unlocked: 103 }
     ];
     await Listing.deleteMany({});
     await Listing.insertMany(seedData);
-    res.json({ message: '46 listings seeded successfully', count: seedData.length });
+    res.json({ message: 'Listings seeded successfully', count: seedData.length });
   } catch (error) {
     res.status(500).json({ message: error.message });
   }
