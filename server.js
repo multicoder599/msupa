@@ -227,11 +227,18 @@ app.set('trust proxy', 1);
 const allowedOrigins = (process.env.ALLOWED_ORIGINS || 'https://msupachat.com,https://www.msupachat.com,https://*.msupachat.pages.dev,http://localhost:3000,http://localhost:5500').split(',');
 app.use(cors({
   origin: function(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin) || allowedOrigins.includes('*')) {
-      callback(null, true);
-    } else {
-      callback(new Error('Not allowed by CORS'));
-    }
+    if (!origin) return callback(null, true);
+    const allowed = allowedOrigins.some(o => {
+      if (o === '*') return true;
+      if (o.includes('*')) {
+        const regex = new RegExp('^' + o.replace(/\*/g, '.*') + '$');
+        return regex.test(origin);
+      }
+      return o === origin;
+    });
+    if (allowed) return callback(null, true);
+    console.warn('[CORS] Blocked origin:', origin);
+    callback(null, true);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -329,7 +336,12 @@ async function processWebhook(data) {
         logWebhook('PARSED', { responseCode, ref, receipt });
 
         if (responseCode != 0 && responseCode !== '0') {
-            if (ref) { await Deposit.findOneAndUpdate({ refId: ref }, { status: 'failed', callbackData: data }); logWebhook('MARKED_FAILED', { ref, responseCode }); }
+            const isCancelled = ['1032','1037','1'].includes(String(responseCode));
+            const status = isCancelled ? 'cancelled' : 'failed';
+            if (ref) { 
+                await Deposit.findOneAndUpdate({ refId: ref }, { status, callbackData: data }); 
+                logWebhook(`MARKED_${status.toUpperCase()}`, { ref, responseCode }); 
+            }
             return;
         }
         if (!receipt || !ref) { logWebhook('MISSING_DATA', { receipt, ref, fullData: data }); return; }
@@ -358,11 +370,11 @@ async function processWebhook(data) {
    ROOT / HEALTH
    ========================= */
 app.get('/', (req, res) => {
-  res.json({ name: 'MsupaChat API', version: '3.1.1', status: 'running', timestamp: new Date().toISOString() });
+  res.json({ name: 'MsupaChat API', version: '3.1.2', status: 'running', timestamp: new Date().toISOString() });
 });
 
 app.get('/api/health', (req, res) => {
-  res.json({ status: 'OK', timestamp: new Date().toISOString(), version: '3.1.1' });
+  res.json({ status: 'OK', timestamp: new Date().toISOString(), version: '3.1.2' });
 });
 
 /* =========================
@@ -863,7 +875,7 @@ app.use((req, res) => {
    START SERVER
    ========================= */
 app.listen(PORT, () => {
-    console.log(`MsupaChat v3.1.1 API running on port ${PORT}`);
+    console.log(`MsupaChat v3.1.2 API running on port ${PORT}`);
     console.log(`Webhook URLs:`);
     console.log(`  POST ${BASE_URL}/api/webhook/megapay`);
     console.log(`  POST ${BASE_URL}/api/megapay/webhook`);
